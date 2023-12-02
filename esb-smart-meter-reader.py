@@ -17,8 +17,9 @@ import logging
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
+import pytz
 import requests
 from bs4 import BeautifulSoup
 from influxdb_client_3 import InfluxDBClient3, Point
@@ -127,6 +128,24 @@ class ESBSmartMeterReader:
         json_data = self.__csv_response_to_json(data_decoded)
         return json_data
 
+    def __get_dst_change_timestamp(self, year):
+        last_october_day = datetime(
+            year, 10, 31, 2, 0, 0, tzinfo=pytz.timezone("Europe/Dublin")
+        )
+        weekday = last_october_day.weekday()  # 0 is Monday, 6 is Sunday
+        days_until_sunday = (weekday + 1) % 7
+        dst_change_timestamp_1am = last_october_day - timedelta(
+            days=days_until_sunday, hours=1
+        )
+        dst_change_timestamp_1_30am = last_october_day - timedelta(
+            days=days_until_sunday, hours=0, minutes=30
+        )
+
+        return [
+            dst_change_timestamp_1am.strftime("%d-%m-%Y %H:%M"),
+            dst_change_timestamp_1_30am.strftime("%d-%m-%Y %H:%M"),
+        ]
+
     def __csv_response_to_json(self, csv_file):
         logging.debug("[+] creating JSON file from CSV ...")
         output_json = []
@@ -137,15 +156,27 @@ class ESBSmartMeterReader:
         )
         logging.debug("Found %s existing records in JSON file", len(existing_entries))
 
+        # List of problematic timestamps during DST change
+        # We get a basic timestamp in IST, but this means a duplicate hour when DST changes in autumn
+        # We can't use the UTC timestamp as the ESB API doesn't return the timezone
+        # So we just ignore the duplicate hours. It's my assumption this means 2 readings with
+        # the same timestamp in InfluxDB, but that's better than a missing reading
+        dst_change_timestamps = [
+            timestamp
+            for i in range(5)
+            for timestamp in self.__get_dst_change_timestamp(datetime.now().year + i)
+        ]
+
         csv_reader = csv.DictReader(csv_file)
         for row in csv_reader:
+            timestamp_str = row["Read Date and End Time"]
             output_json.append(row)
             unique_identifier = row["Read Date and End Time"]
+
             if unique_identifier not in existing_entries:
                 new_entries.append(row)
-                existing_entries.add(unique_identifier)
-            else:
-                print(row)
+                if timestamp_str not in dst_change_timestamps:
+                    existing_entries.add(unique_identifier)
 
         logging.info(
             "Found %s new entries (%s entries downloaded)",

@@ -30,10 +30,6 @@ bucket = esb
 host = http://localhost:8086
 organisation = <your org>
 token = <your access token>
-
-<br><br>
-I hope this will be usefull, cheers!
-<br><br>
 ```
 
 # Usage
