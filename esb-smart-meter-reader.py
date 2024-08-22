@@ -63,14 +63,21 @@ class ESBSmartMeterReader:
         self.__export_to_influx(smart_meter_data)
         logging.info("Import completed and JSON file generated")
 
+    def __extract_xsrf_token(self, cookie_header):
+        cookies = cookie_header.split(',')
+        for cookie in cookies:
+            if 'XSRF-TOKEN' in cookie:
+                token = cookie.split('XSRF-TOKEN=')[1].split(';')[0]
+                return token
+        return None
+
     def __load_esb_data(self, start_date):
+        file_url = 'https://myaccount.esbnetworks.ie/DataHub/DownloadHdfPeriodic'
         logging.info("Loading ESB data for MPRN %s", self.esb_meter_mprn)
         s = requests.Session()
-        s.headers.update(
-            {
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36",
-            }
-        )
+        s.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36',
+        })
         logging.debug("[+] calling login page. ..")
         login_page = s.get("https://myaccount.esbnetworks.ie/", allow_redirects=True)
         result = re.findall(r"(?<=var SETTINGS = )\S*;", str(login_page.content))
@@ -88,7 +95,7 @@ class ESBSmartMeterReader:
             headers={
                 "x-csrf-token": settings["csrf"],
             },
-            allow_redirects=False,
+            allow_redirects=True,
         )
         logging.debug("[+] passing AUTH ...")
         confirm_login = s.get(
@@ -100,33 +107,66 @@ class ESBSmartMeterReader:
                 "p": "B2C_1A_signup_signin",
             },
         )
-        logging.debug("[+] confirm_login: ", confirm_login)
+        # logging.debug("[+] confirm_login: ", confirm_login)
         logging.debug("[+] doing some BeautifulSoup ...")
         soup = BeautifulSoup(confirm_login.content, "html.parser")
         form = soup.find("form", {"id": "auto"})
-        s.post(
-            form["action"],
-            allow_redirects=False,
+        fff=s.post(
+            form['action'],
+            allow_redirects=True,
             data={
-                "state": form.find("input", {"name": "state"})["value"],
-                "client_info": form.find("input", {"name": "client_info"})["value"],
-                "code": form.find("input", {"name": "code"})["value"],
-            },
+              'state': form.find('input', {'name': 'state'})['value'],
+              'client_info': form.find('input', {'name': 'client_info'})['value'],
+              'code': form.find('input', {'name': 'code'})['value'],
+            }, 
         )
+        logging.debug("[!] Status Code: %s" %(fff.status_code))
+        user_welcome_soup = BeautifulSoup(fff.text,'html.parser')
+        user_elements = user_welcome_soup.find('h1', class_='esb-title-h1')
+        if user_elements.text[:2] == "We":
+            print("[!] Confirmed User Login: ", user_elements.text)    # It should return "Welcome, Name Surname"
+        else:
+            print("[!!!] No Welcome message, User is not logged in.")
+            s.close()
 
+        historic_consumption_url = "https://myaccount.esbnetworks.ie/Api/HistoricConsumption"
+        h1_elem = s.get(historic_consumption_url, allow_redirects=True)
+        h1_elem_content = h1_elem.text
+        h1_elem_soup = BeautifulSoup(h1_elem_content, 'html.parser')
+        h1_elem_element = h1_elem_soup.find('h1', class_='esb-title-h1')
+        if h1_elem_element.text[:2] == "My":
+            logging.debug("[+] Jumped to page: %s" %(h1_elem_element.text))    # It should return "My energy Consumption"
+        else:
+            logging.debug("[!] ups - something went wrong.")
+            s.close()
+
+        x_headers={
+          'Host': 'myaccount.esbnetworks.ie',
+          'x-ReturnUrl': historic_consumption_url,
+          'Referer': historic_consumption_url,
+        }
+        x_down = s.get("https://myaccount.esbnetworks.ie/af/t",headers=x_headers)
+        set_cookie_header = x_down.headers.get('Set-Cookie', '')
+        xsrf_token = self.__extract_xsrf_token(set_cookie_header)
+        file_headers = {
+            'Referer': historic_consumption_url,
+            'content-type': 'application/json',
+            'x-returnurl': historic_consumption_url,
+            'x-xsrf-token': xsrf_token,
+            'Origin': "https://myaccount.esbnetworks.ie",
+        }
+        payload_data = {
+            "mprn": self.esb_meter_mprn,
+            "searchType": "intervalkw"
+        }
         logging.debug("[+] getting CSV file for MPRN ...")
-        data = s.get(
-            "https://myaccount.esbnetworks.ie/DataHub/DownloadHdf?mprn="
-            + self.esb_meter_mprn
-            + "&startDate="
-            + start_date.strftime("%Y-%m-%d")
-        )
+        response_data_file = s.post(file_url, headers=file_headers, json=payload_data)
+        s.close()
 
-        logging.debug("[+] CSV file received !!!")
-        data_decoded = data.content.decode("utf-8").splitlines()
-        logging.debug("[+] data decoded from Binary format")
-        json_data = self.__csv_response_to_json(data_decoded)
-        return json_data
+        magic_data = response_data_file.content.decode("utf-8")
+        csv_reader = csv.DictReader(magic_data.split('\n'))
+
+        return self.__csv_response_to_json(csv_reader)
 
     def __get_dst_change_timestamp(self, year):
         last_october_day = datetime(
@@ -146,7 +186,7 @@ class ESBSmartMeterReader:
             dst_change_timestamp_1_30am.strftime("%d-%m-%Y %H:%M"),
         ]
 
-    def __csv_response_to_json(self, csv_file):
+    def __csv_response_to_json(self, csv_reader):
         logging.debug("[+] creating JSON file from CSV ...")
         output_json = []
         existing_data = self.__get_previous_data()
@@ -167,7 +207,6 @@ class ESBSmartMeterReader:
             for timestamp in self.__get_dst_change_timestamp(datetime.now().year + i)
         ]
 
-        csv_reader = csv.DictReader(csv_file)
         for row in csv_reader:
             timestamp_str = row["Read Date and End Time"]
             output_json.append(row)
